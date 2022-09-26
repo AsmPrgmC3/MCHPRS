@@ -610,8 +610,8 @@ impl Compiler {
 
         // TODO: Remove this once there is proper backend switching
         if self.jit.is_none() {
-            let jit: Box<backend::direct::DirectBackend> = Default::default();
-            // let jit: Box<codegen::cranelift::CraneliftBackend> = Default::default();
+            // let jit: Box<backend::direct::DirectBackend> = Default::default();
+            let jit: Box<backend::cranelift::CraneliftBackend> = Default::default();
             self.use_jit(jit);
         }
 
