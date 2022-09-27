@@ -1,19 +1,24 @@
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
-use std::mem;
 use std::pin::Pin;
+use std::{array, mem};
 
+use cranelift::codegen;
+use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift::prelude::{types, AbiParam, Block as CLBlock, InstBuilder, MemFlags, Type, Value};
 use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
+use itertools::Itertools;
 use log::warn;
 
 use mchprs_blocks::block_entities::BlockEntity;
 use mchprs_blocks::BlockPos;
 use mchprs_world::{TickEntry, TickPriority};
 
-use crate::blocks::Block;
+use crate::blocks::{Block, RedstoneRepeater};
 use crate::plot::PlotWorld;
 use crate::redpiler::backend::JITBackend;
-use crate::redpiler::{block_powered_mut, bool_to_ss, CompileNode};
+use crate::redpiler::{block_powered_mut, CompileNode, NodeId};
 use crate::world::World;
 
 #[derive(Debug, Copy, Clone)]
@@ -50,51 +55,34 @@ impl From<CLTickPriority> for TickPriority {
 #[derive(Debug, Copy, Clone)]
 struct NodeIndex(usize);
 
-type TickFunction = (
-    unsafe extern "C" fn(*mut TickScheduler, usize, u8, *mut u8, *mut bool) -> (),
-    usize,
-);
+type TickFunction = unsafe extern "C" fn(*mut TickScheduler, u8) -> ();
 
 pub struct CraneliftBackend {
     num_nodes: usize,
-    power_data: RawSlice<u8>,
-    locked_data: RawSlice<bool>,
-    scheduled_data: RawSlice<bool>,
-    changed_data: RawSlice<bool>,
-    tick_functions: Box<[TickFunction]>,
-    module: JITModule,
+    program: Program,
     nodes: Box<[CompileNode]>,
     blocks: Box<[(BlockPos, Block)]>,
     is_io_block: Box<[bool]>,
     pos_map: HashMap<BlockPos, NodeIndex>,
-    scheduler: Pin<Box<UnsafeCell<TickScheduler>>>,
 }
 
 impl Default for CraneliftBackend {
     fn default() -> Self {
-        let mut builder = JITBuilder::new(cranelift_module::default_libcall_names());
-        let module = JITModule::new(builder.unwrap());
         Self {
             num_nodes: 0,
-            power_data: Default::default(),
-            locked_data: Default::default(),
-            scheduled_data: Default::default(),
-            changed_data: Default::default(),
-            tick_functions: Box::new([]),
-            module,
+            program: Default::default(),
             nodes: Box::new([]),
             blocks: Box::new([]),
             is_io_block: Box::new([]),
             pos_map: Default::default(),
-            scheduler: Box::pin(UnsafeCell::new(Default::default())),
         }
     }
 }
 
 impl CraneliftBackend {
-    fn schedule_tick(&self, tick_fn: TickFunction, delay: usize, priority: CLTickPriority) {
-        let scheduler = unsafe { &mut *self.scheduler.get() };
-        scheduler.schedule_tick(tick_fn, delay, priority);
+    fn schedule_tick(&self, node_id: NodeId, delay: usize, priority: CLTickPriority) {
+        let scheduler = unsafe { &mut *self.program.scheduler.get() };
+        scheduler.schedule_tick(node_id, delay, priority);
     }
 }
 
@@ -108,12 +96,8 @@ impl JITBackend for CraneliftBackend {
         }
         let mut power_data = vec![];
         let mut locked_data = vec![];
-        let mut scheduled_data = vec![];
-        let mut changed_data = vec![];
         let mut is_io_block = vec![];
         for node in &*self.nodes {
-            scheduled_data.push(false);
-
             power_data.push(node.output_power());
 
             let locked = match node.state {
@@ -121,8 +105,6 @@ impl JITBackend for CraneliftBackend {
                 _ => false,
             };
             locked_data.push(locked);
-
-            changed_data.push(false);
 
             let is_io = matches!(
                 node.state,
@@ -135,55 +117,23 @@ impl JITBackend for CraneliftBackend {
             is_io_block.push(is_io);
         }
 
-        let scheduler = unsafe { &mut *self.scheduler.get() };
-        for i in 0..self.num_nodes {
-            let node_index = NodeIndex(i);
-            let node = &self.nodes[node_index.0];
-            let tick_func: TickFunction;
-            if matches!(node.state, Block::RedstoneWire { .. }) {
-                tick_func = (wire_tick, node_index.0);
-            } else {
-                tick_func = (generic_tick, node_index.0);
-            }
-            scheduler.schedule_tick(tick_func, 1, CLTickPriority::Normal);
-        }
-        // for tick_entry in ticks {
-        //     let node_index = self.pos_map[&tick_entry.pos];
-        //     let node = &self.nodes[node_index.0];
-        //     let tick_func: TickFunction;
-        //     if matches!(node.state, Block::RedstoneWire { .. }) {
-        //         tick_func = (wire_tick, node_index.0);
-        //     } else {
-        //         tick_func = (generic_tick, node_index.0);
-        //     }
-        //     scheduler.schedule_tick(
-        //         tick_func,
-        //         tick_entry.ticks_left as usize,
-        //         tick_entry.tick_priority.into(),
-        //     );
-        // }
-
-        self.changed_data = changed_data.into();
         self.is_io_block = is_io_block.into();
-        self.locked_data = locked_data.into();
-        self.power_data = power_data.into();
-        self.scheduled_data = scheduled_data.into();
+
+        self.program = Program::compile(&self.nodes, power_data, locked_data);
+
+        let scheduler = unsafe { &mut *self.program.scheduler.get() };
+        for i in 0..self.num_nodes {
+            scheduler.schedule_tick(i, 1, CLTickPriority::Normal);
+        }
     }
 
     fn tick(&mut self, _plot: &mut PlotWorld) {
-        let mut queues = unsafe { &mut *self.scheduler.get() }.queues_this_tick();
-        for (tick_func, index) in queues.drain_iter() {
-            unsafe {
-                tick_func(
-                    self.scheduler.get(),
-                    index,
-                    0,
-                    self.power_data.ptr as _,
-                    self.changed_data.ptr as _,
-                )
-            };
+        let mut queues = unsafe { &mut *self.program.scheduler.get() }.queues_this_tick();
+        for node_id in queues.drain_iter() {
+            let tick_func = self.program.tick_functions[node_id];
+            unsafe { tick_func(self.program.scheduler.get(), 0) };
         }
-        unsafe { &mut *self.scheduler.get() }.end_tick(queues);
+        unsafe { &mut *self.program.scheduler.get() }.end_tick(queues);
     }
 
     fn on_use_block(&mut self, _plot: &mut PlotWorld, pos: BlockPos) {
@@ -192,29 +142,13 @@ impl JITBackend for CraneliftBackend {
         match node.state {
             Block::StoneButton { .. } => {
                 unsafe {
-                    self.tick_functions[node_index.0].0(
-                        self.scheduler.get(),
-                        node_index.0,
-                        1,
-                        self.power_data.ptr as _,
-                        self.changed_data.ptr as _,
-                    )
+                    self.program.tick_functions[node_index.0](self.program.scheduler.get(), 1)
                 };
-                self.schedule_tick(
-                    self.tick_functions[node_index.0],
-                    10,
-                    CLTickPriority::Normal,
-                );
+                self.schedule_tick(node_index.0, 10, CLTickPriority::Normal);
             }
             Block::Lever { .. } => {
                 unsafe {
-                    self.tick_functions[node_index.0].0(
-                        self.scheduler.get(),
-                        node_index.0,
-                        0,
-                        self.power_data.ptr as _,
-                        self.changed_data.ptr as _,
-                    )
+                    self.program.tick_functions[node_index.0](self.program.scheduler.get(), 0)
                 };
             }
             _ => warn!("Tried to use a {:?} redpiler node", node.state),
@@ -227,12 +161,9 @@ impl JITBackend for CraneliftBackend {
         match node.state {
             Block::StonePressurePlate { .. } => {
                 unsafe {
-                    self.tick_functions[node_id.0].0(
-                        self.scheduler.get(),
-                        node_id.0,
+                    self.program.tick_functions[node_id.0](
+                        self.program.scheduler.get(),
                         powered as _,
-                        self.power_data.ptr as _,
-                        self.changed_data.ptr as _,
                     )
                 };
             }
@@ -241,8 +172,8 @@ impl JITBackend for CraneliftBackend {
     }
 
     fn flush(&mut self, plot: &mut PlotWorld, io_only: bool) {
-        let changed_data = unsafe { self.changed_data.as_mut_slice() };
-        let power_data = unsafe { self.power_data.as_slice() };
+        let changed_data = unsafe { self.program.changed_data.as_mut_slice() };
+        let power_data = unsafe { self.program.power_data.as_slice() };
 
         for node_index in 0..self.num_nodes {
             let changed = &mut changed_data[node_index];
@@ -262,9 +193,9 @@ impl JITBackend for CraneliftBackend {
     }
 
     fn reset(&mut self, plot: &mut PlotWorld, io_only: bool) {
-        unsafe { &mut *self.scheduler.get() }.reset(plot, &self.blocks);
+        unsafe { &mut *self.program.scheduler.get() }.reset(plot, &self.blocks);
 
-        let power_data = unsafe { self.power_data.as_slice() };
+        let power_data = unsafe { self.program.power_data.as_slice() };
 
         for node_index in 0..self.num_nodes {
             let (pos, block) = self.blocks[node_index];
@@ -283,11 +214,302 @@ impl JITBackend for CraneliftBackend {
     }
 }
 
+struct Program {
+    power_data: RawSlice<u8>,
+    locked_data: RawSlice<bool>,
+    scheduled_data: RawSlice<bool>,
+    changed_data: RawSlice<bool>,
+    scheduler: Pin<Box<UnsafeCell<TickScheduler>>>,
+    tick_functions: Box<[TickFunction]>,
+}
+
+impl Default for Program {
+    fn default() -> Self {
+        Self {
+            power_data: Default::default(),
+            locked_data: Default::default(),
+            scheduled_data: Default::default(),
+            changed_data: Default::default(),
+            scheduler: Box::pin(Default::default()),
+            tick_functions: Box::new([]),
+        }
+    }
+}
+
+impl Program {
+    fn compile(nodes: &[CompileNode], power_data: Vec<u8>, locked_data: Vec<bool>) -> Self {
+        let num_nodes = nodes.len();
+        assert_eq!(num_nodes, power_data.len());
+        assert_eq!(num_nodes, locked_data.len());
+
+        let mut program = Program {
+            power_data: power_data.into(),
+            locked_data: locked_data.into(),
+            scheduled_data: vec![false; num_nodes].into(),
+            changed_data: vec![false; num_nodes].into(),
+            scheduler: Box::pin(Default::default()),
+            tick_functions: Box::new([]),
+        };
+
+        let mut builder = JITBuilder::new(default_libcall_names()).unwrap();
+        let mut module = JITModule::new(builder);
+
+        let mut context = JitContext {
+            builder_context: FunctionBuilderContext::new(),
+            ctx: module.make_context(),
+            ptr_type: module.target_config().pointer_type(),
+            globals: JitGlobals {
+                jit_schedule_tick: jit_schedule_tick as _,
+                power_data: program.power_data.ptr as *mut u8 as _,
+                locked_data: program.locked_data.ptr as *mut bool as _,
+                scheduled_data: program.scheduled_data.ptr as *mut bool as _,
+                changed_data: program.changed_data.ptr as *mut bool as _,
+            },
+            module,
+        };
+
+        let funcs = nodes
+            .iter()
+            .enumerate()
+            .map(|(node_id, node)| context.compile_node(node, node_id))
+            .collect_vec();
+
+        let mut module = context.module;
+
+        module.finalize_definitions();
+
+        let funcs = funcs
+            .into_iter()
+            .map(|func_id| {
+                let addr = module.get_finalized_function(func_id);
+                unsafe { mem::transmute(addr) }
+            })
+            .collect_vec();
+
+        program.tick_functions = funcs.into_boxed_slice();
+
+        program
+    }
+}
+
+#[derive(Copy, Clone)]
+struct JitGlobals {
+    jit_schedule_tick: usize,
+    power_data: usize,
+    locked_data: usize,
+    scheduled_data: usize,
+    changed_data: usize,
+}
+
+struct JitContext {
+    builder_context: FunctionBuilderContext,
+    ctx: codegen::Context,
+    ptr_type: Type,
+    globals: JitGlobals,
+    module: JITModule,
+}
+
+impl JitContext {
+    fn compile_node(&mut self, node: &CompileNode, node_id: NodeId) -> FuncId {
+        self.ctx
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(self.ptr_type));
+        self.ctx
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(types::I8));
+
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
+
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+
+        let mut translator = FunctionTranslator {
+            ptr_type: self.ptr_type,
+            module: &mut self.module,
+            scheduler: builder.block_params(entry_block)[0],
+            argument: builder.block_params(entry_block)[1],
+            builder,
+            globals: self.globals,
+            variable_index: 0,
+        };
+
+        translator.translate_node(node, node_id);
+
+        translator.builder.ins().return_(&[]);
+
+        translator.builder.finalize();
+
+        let func_id = self
+            .module
+            .declare_function(
+                &format!("tick_{node_id}"),
+                Linkage::Export,
+                &self.ctx.func.signature,
+            )
+            .unwrap();
+        self.module.define_function(func_id, &mut self.ctx).unwrap();
+
+        self.module.clear_context(&mut self.ctx);
+
+        func_id
+    }
+}
+
+struct FunctionTranslator<'a> {
+    ptr_type: Type,
+    module: &'a mut JITModule,
+    scheduler: Value,
+    argument: Value,
+    builder: FunctionBuilder<'a>,
+    globals: JitGlobals,
+    variable_index: usize,
+}
+
+impl<'a> FunctionTranslator<'a> {
+    fn translate_node(&mut self, node: &CompileNode, node_id: NodeId) {
+        let false_value = self.false_value();
+        self.store_buffer(self.globals.scheduled_data, node_id, false_value);
+
+        match &node.state {
+            Block::RedstoneRepeater { repeater } => {
+                self.translate_repeater(node, repeater, node_id)
+            }
+            Block::RedstoneWire { .. } => self.translate_wire(node, node_id),
+
+            _ => {}
+        }
+    }
+
+    fn translate_repeater(
+        &mut self,
+        node: &CompileNode,
+        repeater: &RedstoneRepeater,
+        node_id: usize,
+    ) {
+        let power = self.load_buffer(self.globals.power_data, node_id);
+
+        let [turn_on_block, turn_off_block, end_block] = self.create_blocks();
+
+        self.builder.ins().brz(power, turn_on_block, &[]);
+        self.builder.ins().jump(turn_off_block, &[]);
+
+        self.switch_seal_block(turn_on_block);
+        let one_value = self.one_value();
+        self.builder.ins().jump(end_block, &[one_value]);
+
+        self.switch_seal_block(turn_off_block);
+        let zero_value = self.zero_value();
+        self.builder.ins().jump(end_block, &[zero_value]);
+
+        self.switch_seal_block(end_block);
+        self.builder.append_block_param(end_block, types::I8);
+        let power_value = self.builder.block_params(end_block)[0];
+        self.set_power(node_id, power_value);
+
+        self.schedule_tick(node_id, 1, CLTickPriority::High);
+    }
+
+    fn translate_wire(&mut self, node: &CompileNode, node_id: usize) {
+        let power = self.load_buffer(self.globals.power_data, node_id);
+        let one_value = self.one_value();
+        let power = self.builder.ins().iadd(power, one_value);
+        let _15 = self.builder.ins().iconst(types::I8, 15);
+        let power = self.builder.ins().urem(power, _15);
+        self.set_power(node_id, power);
+
+        self.schedule_tick(node_id, 1, CLTickPriority::Normal);
+    }
+
+    fn create_blocks<const COUNT: usize>(&mut self) -> [CLBlock; COUNT] {
+        array::from_fn(|_| self.builder.create_block())
+    }
+
+    fn switch_seal_block(&mut self, block: CLBlock) {
+        self.builder.switch_to_block(block);
+        self.builder.seal_block(block);
+    }
+
+    fn load_buffer(&mut self, buffer: usize, offset: usize) -> Value {
+        let addr = self
+            .builder
+            .ins()
+            .iconst(self.ptr_type, (buffer + offset) as i64);
+        self.builder
+            .ins()
+            .load(types::I8, MemFlags::trusted(), addr, 0)
+    }
+
+    fn store_buffer(&mut self, buffer: usize, offset: usize, value: Value) {
+        let addr = self
+            .builder
+            .ins()
+            .iconst(self.ptr_type, (buffer + offset) as i64);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), value, addr, 0);
+    }
+
+    fn set_power(&mut self, node_id: usize, power: Value) {
+        self.store_buffer(self.globals.power_data, node_id, power);
+        let true_value = self.true_value();
+        self.store_buffer(self.globals.changed_data, node_id, true_value);
+    }
+
+    fn schedule_tick(&mut self, node_id: NodeId, delay: usize, priority: CLTickPriority) {
+        let mut sig = self.module.make_signature();
+        sig.params = vec![
+            AbiParam::new(self.ptr_type),
+            AbiParam::new(self.ptr_type),
+            AbiParam::new(self.ptr_type),
+            AbiParam::new(types::I8),
+        ];
+        let sig = self.builder.import_signature(sig);
+
+        let jit_schedule_tick_value = self
+            .builder
+            .ins()
+            .iconst(self.ptr_type, self.globals.jit_schedule_tick as i64);
+        let node_id_value = self.builder.ins().iconst(self.ptr_type, node_id as i64);
+        let delay_value = self.builder.ins().iconst(self.ptr_type, delay as i64);
+        let priority_value = self.builder.ins().iconst(types::I8, priority as i64);
+        self.builder.ins().call_indirect(
+            sig,
+            jit_schedule_tick_value,
+            &[self.scheduler, node_id_value, delay_value, priority_value],
+        );
+
+        let true_value = self.true_value();
+        self.store_buffer(self.globals.scheduled_data, node_id, true_value);
+    }
+
+    fn true_value(&mut self) -> Value {
+        self.builder.ins().iconst(types::I8, 1)
+    }
+
+    fn false_value(&mut self) -> Value {
+        self.builder.ins().iconst(types::I8, 0)
+    }
+
+    fn zero_value(&mut self) -> Value {
+        self.builder.ins().iconst(types::I8, 0)
+    }
+
+    fn one_value(&mut self) -> Value {
+        self.builder.ins().iconst(types::I8, 1)
+    }
+}
+
 #[derive(Default, Clone)]
-struct Queues([Vec<TickFunction>; TickScheduler::NUM_PRIORITIES]);
+struct Queues([Vec<NodeId>; TickScheduler::NUM_PRIORITIES]);
 
 impl Queues {
-    fn drain_iter(&mut self) -> impl Iterator<Item = TickFunction> + '_ {
+    fn drain_iter(&mut self) -> impl Iterator<Item = NodeId> + '_ {
         let [q0, q1, q2, q3] = &mut self.0;
         let [q0, q1, q2, q3] = [q0, q1, q2, q3].map(|q| q.drain(..));
         q0.chain(q1).chain(q2).chain(q3)
@@ -306,7 +528,7 @@ impl TickScheduler {
         for (delay, queues) in self.queues_deque.iter().enumerate() {
             for (entries, priority) in queues.0.iter().zip(Self::priorities()) {
                 for node in entries {
-                    let pos = blocks[node.1].0;
+                    let pos = blocks[*node].0;
                     plot.schedule_tick(pos, delay as u32, priority.into());
                 }
             }
@@ -314,12 +536,12 @@ impl TickScheduler {
         self.queues_deque.clear();
     }
 
-    fn schedule_tick(&mut self, function: TickFunction, delay: usize, priority: CLTickPriority) {
+    fn schedule_tick(&mut self, node: NodeId, delay: usize, priority: CLTickPriority) {
         if delay >= self.queues_deque.len() {
             self.queues_deque.resize(delay + 1, Default::default());
         }
 
-        self.queues_deque[delay].0[Self::priority_index(priority)].push(function);
+        self.queues_deque[delay].0[Self::priority_index(priority)].push(node);
     }
 
     fn queues_this_tick(&mut self) -> Queues {
@@ -396,39 +618,11 @@ impl<T> RawSlice<T> {
     }
 }
 
-unsafe extern "C" fn schedule_tick(
+unsafe extern "C" fn jit_schedule_tick(
     scheduler: *mut TickScheduler,
-    tick_func: TickFunction,
+    node_id: NodeId,
     delay: usize,
     priority: CLTickPriority,
 ) {
-    (&mut *scheduler).schedule_tick(tick_func, delay, priority);
-}
-
-unsafe extern "C" fn wire_tick(
-    scheduler: *mut TickScheduler,
-    index: usize,
-    _data: u8,
-    power_data: *mut u8,
-    changed_data: *mut bool,
-) {
-    let power = power_data.offset(index as _).read();
-    let new_power = (power + 1) % 15;
-    power_data.offset(index as _).write(new_power);
-    changed_data.offset(index as _).write(true);
-    schedule_tick(scheduler, (wire_tick, index), 1, CLTickPriority::Normal);
-}
-
-unsafe extern "C" fn generic_tick(
-    scheduler: *mut TickScheduler,
-    index: usize,
-    _data: u8,
-    power_data: *mut u8,
-    changed_data: *mut bool,
-) {
-    let current = power_data.offset(index as _).read() > 0;
-    let new = bool_to_ss(!current);
-    power_data.offset(index as _).write(new);
-    changed_data.offset(index as _).write(true);
-    schedule_tick(scheduler, (generic_tick, index), 1, CLTickPriority::High);
+    (&mut *scheduler).schedule_tick(node_id, delay, priority);
 }

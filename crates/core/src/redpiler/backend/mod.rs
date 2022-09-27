@@ -3,6 +3,8 @@ pub mod cranelift;
 pub mod direct;
 // pub mod par_direct;
 
+// pub mod cranelift_old;
+
 use crate::plot::PlotWorld;
 use mchprs_blocks::BlockPos;
 use mchprs_world::TickEntry;
